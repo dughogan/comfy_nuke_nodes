@@ -4,13 +4,12 @@ SwitchWhich + SwitchWhichInfo — Nuke-style Switch nodes for ComfyUI.
 SwitchWhich:
 - Accepts any input type via wildcard '*'
 - IMAGE inputs automatically get a paired mask_N slot
-- Outputs: data (matched type), mask (MASK | None)
-- JS patches output type to match the active input
+- Only evaluates the active input (lazy evaluation via check_lazy_status)
+- Outputs: data (matched type), mask (MASK | None), _metadata (STRING, internal)
 
 SwitchWhichInfo:
-- Connect to a SwitchWhich node's data output
+- Connect to a SwitchWhich node's _metadata output
 - Outputs: node_name (STRING) — title of the upstream node on the active input
-- Reads metadata serialized by JS into the SwitchWhich node
 """
 
 import json
@@ -23,8 +22,8 @@ class SwitchWhich:
     def INPUT_TYPES(cls):
         optional = {}
         for i in range(MAX_INPUTS):
-            optional[f"input_{i}"] = ("*",)
-            optional[f"mask_{i}"]  = ("MASK",)
+            optional[f"input_{i}"] = ("*", {"lazy": True})
+            optional[f"mask_{i}"]  = ("MASK", {"lazy": True})
         return {
             "required": {
                 "which": ("INT", {
@@ -41,9 +40,7 @@ class SwitchWhich:
                     "step": 1,
                     "display": "number",
                 }),
-                # Written by JS — JSON array of booleans, true = that slot is IMAGE type
                 "slot_is_image":   ("STRING", {"default": "[]"}),
-                # Written by JS — JSON array of all upstream node titles
                 "upstream_titles": ("STRING", {"default": "[]"}),
             },
             "optional": optional,
@@ -54,8 +51,43 @@ class SwitchWhich:
     FUNCTION     = "switch"
     CATEGORY     = "utils"
 
+    def check_lazy_status(self, which, num_inputs, slot_is_image, upstream_titles, **kwargs):
+        """
+        Tell ComfyUI which inputs we actually need evaluated.
+        Only request input_which (and its mask if IMAGE).
+        If that input isn't connected, walk back to find the nearest connected one.
+        """
+        needed = []
+
+        # Find the first connected input at or before 'which'
+        resolved = None
+        for i in range(which, -1, -1):
+            key = f"input_{i}"
+            # kwargs contains None for lazy inputs not yet evaluated,
+            # and is absent entirely for unconnected inputs.
+            # We need to check if the slot is wired at all.
+            if key in kwargs:
+                resolved = i
+                break
+
+        if resolved is not None:
+            needed.append(f"input_{resolved}")
+
+            # Only request mask if this slot is IMAGE type
+            try:
+                is_image_flags = json.loads(slot_is_image)
+            except Exception:
+                is_image_flags = []
+
+            if resolved < len(is_image_flags) and is_image_flags[resolved]:
+                mask_key = f"mask_{resolved}"
+                if mask_key in kwargs:
+                    needed.append(mask_key)
+
+        return needed
+
     def switch(self, which, num_inputs, slot_is_image, upstream_titles, **kwargs):
-        # Resolve data, with fallback to nearest connected input
+        # Resolve data, falling back if which isn't connected
         data = kwargs.get(f"input_{which}")
         resolved_index = which
 
@@ -83,7 +115,7 @@ class SwitchWhich:
         )
         mask = kwargs.get(f"mask_{resolved_index}") if slot_is_img else None
 
-        # Pass metadata blob to Info node (JSON string)
+        # Pack metadata for the Info node
         metadata = json.dumps({
             "titles":   json.loads(upstream_titles) if upstream_titles else [],
             "resolved": resolved_index,
